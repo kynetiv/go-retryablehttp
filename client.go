@@ -376,6 +376,7 @@ type ErrorHandler func(resp *http.Response, err error, numTries int) (*http.Resp
 type Client struct {
 	HTTPClient *http.Client // Internal HTTP client.
 	Logger     interface{}  // Customer logger instance. Can be either Logger or LeveledLogger
+	LoggerContextKey interface{} // Customer logger context key of a Logger or LeveledLogger in request context
 
 	RetryWaitMin time.Duration // Minimum time to wait
 	RetryWaitMax time.Duration // Maximum time to wait
@@ -416,22 +417,34 @@ func NewClient() *Client {
 	}
 }
 
-func (c *Client) logger() interface{} {
+func (c *Client) logger(ctx context.Context) interface{} {
 	c.loggerInit.Do(func() {
-		if c.Logger == nil {
-			return
+		if c.Logger != nil {
+			c.checkLoggerType(c.Logger)
 		}
 
-		switch c.Logger.(type) {
-		case Logger, LeveledLogger:
-			// ok
-		default:
-			// This should happen in dev when they are setting Logger and work on code, not in prod.
-			panic(fmt.Sprintf("invalid logger type passed, must be Logger or LeveledLogger, was %T", c.Logger))
+		if c.LoggerContextKey != nil {
+			ctxLogger := ctx.Value(c.LoggerContextKey)
+			if ctxLogger != nil {
+				c.checkLoggerType(ctxLogger)
+			}
 		}
 	})
 
-	return c.Logger
+	if logger := ctx.Value(c.LoggerContextKey); logger != nil {
+		return logger // Prioritize context key-based logger if found
+	}
+	return c.Logger // Default to the logger on the Client struct if context key-based logger not found
+}
+
+func (c *Client) checkLoggerType(logger interface{}) {
+	switch logger.(type) {
+	case Logger, LeveledLogger:
+		// ok
+	default:
+		// This should happen in dev when they are setting Logger and work on code, not in prod.
+		panic(fmt.Sprintf("invalid logger type passed, must be Logger or LeveledLogger, was %T", logger))
+	}
 }
 
 // DefaultRetryPolicy provides a default callback for Client.CheckRetry, which
@@ -582,7 +595,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 		}
 	})
 
-	logger := c.logger()
+	logger := c.logger(req.Context())
 
 	if logger != nil {
 		switch v := logger.(type) {
@@ -677,7 +690,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 
 		// We're going to retry, consume any response to reuse the connection.
 		if doErr == nil {
-			c.drainBody(resp.Body)
+			c.drainBody(req.Context(), resp.Body)
 		}
 
 		wait := c.Backoff(c.RetryWaitMin, c.RetryWaitMax, i, resp)
@@ -731,7 +744,7 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 	// By default, we close the response body and return an error without
 	// returning the response
 	if resp != nil {
-		c.drainBody(resp.Body)
+		c.drainBody(req.Context(), resp.Body)
 	}
 
 	// this means CheckRetry thought the request was a failure, but didn't
@@ -746,12 +759,12 @@ func (c *Client) Do(req *Request) (*http.Response, error) {
 }
 
 // Try to read the response body so we can reuse this connection.
-func (c *Client) drainBody(body io.ReadCloser) {
+func (c *Client) drainBody(ctx context.Context, body io.ReadCloser) {
 	defer body.Close()
 	_, err := io.Copy(ioutil.Discard, io.LimitReader(body, respReadLimit))
 	if err != nil {
-		if c.logger() != nil {
-			switch v := c.logger().(type) {
+		if logger := c.logger(ctx); logger != nil {
+			switch v := logger.(type) {
 			case LeveledLogger:
 				v.Error("error reading response body", "error", err)
 			case Logger:
